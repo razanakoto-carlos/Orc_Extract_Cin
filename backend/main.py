@@ -15,6 +15,7 @@ import numpy as np
 from datetime import datetime
 from typing import Dict, Optional
 from fastapi.staticfiles import StaticFiles
+from deepface_service import face_search_service
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -219,30 +220,6 @@ def detect_photo_region(image_bytes: bytes) -> Optional[bytes]:
 # ============================================================================
 # API ENDPOINTS
 # ============================================================================
-@app.get("/")
-async def root():
-    """Health check endpoint"""
-    try:
-        db = SessionLocal()
-        total_docs = db.query(Document).count()
-        db.close()
-    except:
-        total_docs = 0
-    
-    try:
-        total_photos = len([f for f in os.listdir(IMAGES_FOLDER) if f.endswith('.jpg')])
-    except:
-        total_photos = 0
-    
-    return {
-        "status": "running",
-        "service": "OCR Document Extractor",
-        "version": "1.0.0",
-        "total_documents": total_docs,
-        "total_photos": total_photos,
-        "images_folder": IMAGES_FOLDER
-    }
-
 @app.post("/ocr", response_model=OCRResponse)
 async def extract_ocr(file: UploadFile = File(...)):
     """Extract text and structured data from uploaded image"""
@@ -420,6 +397,114 @@ async def save_document(
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Save failed: {str(e)}")
 
+# FACE SEARCH ENDPOINTS
+@app.post("/face/search")
+async def search_by_face(
+    file: UploadFile = File(...),
+    threshold: float = 0.4,
+    top_k: int = 10,
+    db: Session = Depends(get_db)
+):
+    """
+    Search for similar faces in database
+    """
+    allowed_types = ["image/png", "image/jpeg", "image/jpg", "image/webp"]
+    if file.content_type not in allowed_types:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid file type. Allowed: {', '.join(allowed_types)}"
+        )
+    
+    try:
+        # Read uploaded image
+        image_bytes = await file.read()
+        
+        # Extract embedding from query image
+        query_embedding = face_search_service.extract_embedding_from_bytes(image_bytes)
+        
+        if query_embedding is None:
+            raise HTTPException(
+                status_code=400,
+                detail="No face detected in the uploaded image"
+            )
+        
+        # Get all documents from database with face photos
+        documents = db.query(Document).filter(Document.has_face_photo == True).all()
+        
+        # Convert to list of dicts
+        doc_dicts = [
+            {
+                'id': doc.id,
+                'photo_visage_path': doc.photo_visage_path,
+                'has_face_photo': doc.has_face_photo
+            }
+            for doc in documents
+        ]
+        
+        # Load database embeddings
+        db_embeddings = face_search_service.load_database_embeddings(doc_dicts)
+        
+        if not db_embeddings:
+            raise HTTPException(
+                status_code=404,
+                detail="No face photos available in database for comparison"
+            )
+        
+        # Search for similar faces
+        matches = face_search_service.search_similar_faces(
+            query_embedding=query_embedding,
+            database_embeddings=db_embeddings,
+            threshold=threshold,
+            top_k=top_k
+        )
+        
+        # Add document details to matches
+        for match in matches:
+            doc = db.query(Document).filter(Document.id == match['document_id']).first()
+            if doc:
+                match.update({
+                    'nom': doc.nom,
+                    'prenoms': doc.prenoms,
+                    'numero_cin': doc.numero_cin,
+                    'photo_url': f"/images/{os.path.basename(doc.photo_visage_path)}" if doc.photo_visage_path else None
+                })
+        
+        return {
+            "success": True,
+            "matches": matches,
+            "query_faces_detected": 1,
+            "database_faces_compared": len(db_embeddings),
+            "threshold_used": threshold
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Face search failed: {str(e)}")
+
+@app.get("/face/stats")
+async def get_face_search_stats(db: Session = Depends(get_db)):
+    """
+    Get statistics for face search
+    """
+    total_docs = db.query(Document).count()
+    docs_with_faces = db.query(Document).filter(Document.has_face_photo == True).count()
+    
+    # Count cached embeddings
+    cache_dir = "face_embeddings"
+    cached_embeddings = 0
+    if os.path.exists(cache_dir):
+        cached_embeddings = len([f for f in os.listdir(cache_dir) if f.endswith('.npy')])
+    
+    return {
+        "total_documents": total_docs,
+        "documents_with_face_photos": docs_with_faces,
+        "cached_embeddings": cached_embeddings,
+        "embedding_model": "Facenet",
+        "similarity_metric": "Cosine"
+    }
 # ============================================================================
 # DATABASE QUERY ENDPOINTS
 # ============================================================================
@@ -506,6 +591,13 @@ async def delete_document(
         except Exception as e:
             print(f"⚠️ Warning: Could not delete photo: {str(e)}")
     
+    # Clear face embedding cache
+    try:
+        face_search_service.clear_cache_for_document(document_id)
+        print(f"✅ Cleared face cache for document {document_id}")
+    except Exception as e:
+        print(f"⚠️ Warning: Could not clear face cache: {str(e)}")
+    
     db.delete(document)
     db.commit()
     
@@ -513,9 +605,7 @@ async def delete_document(
         "success": True,
         "message": f"Document {document_id} deleted",
         "deleted_id": document_id
-    }
-
-# ============================================================================
+    }# ============================================================================
 # RUN SERVER
 # ============================================================================
 if __name__ == "__main__":
