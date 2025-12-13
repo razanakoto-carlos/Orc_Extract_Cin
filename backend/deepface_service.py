@@ -6,6 +6,13 @@ import os
 from typing import List, Dict, Tuple, Optional
 import base64
 from datetime import datetime
+import tensorflow as tf
+
+# Explicitly disable GPU
+os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+
+# Configure TensorFlow to use CPU only and limit memory growth
+tf.config.set_visible_devices([], 'GPU')
 
 class FaceSearchService:
     def __init__(self, images_folder: str = "images"):

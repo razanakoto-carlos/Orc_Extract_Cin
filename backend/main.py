@@ -526,8 +526,8 @@ class DocumentResponse(BaseModel):
     date_sauvegarde: datetime
     
     class Config:
-        # orm_mode = True
-        from_attributes = True 
+        orm_mode = True
+        # from_attributes = True 
 
 @app.get("/documents/db", response_model=List[DocumentResponse])
 async def list_documents_db(
